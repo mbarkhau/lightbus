@@ -9,6 +9,7 @@ from asyncio import CancelledError
 from collections import defaultdict
 from datetime import timedelta
 from itertools import chain
+from threading import Thread
 from typing import List, Tuple, Coroutine, Union
 
 import janus
@@ -52,7 +53,7 @@ from lightbus.utilities.deforming import deform_to_bus
 from lightbus.utilities.frozendict import frozendict
 from lightbus.utilities.human import human_time
 from lightbus.utilities.logging import log_transport_information
-from lightbus.utilities.threading_tools import run_in_main_thread, assert_in_main_thread
+from lightbus.utilities.threading_tools import run_in_bus_thread, assert_in_client_thread
 
 if False:
     # pylint: disable=unused-import
@@ -73,8 +74,22 @@ class BusClient(object):
     All functionality in `BusPath` is provided by `BusClient`.
     """
 
-    @assert_in_main_thread()
+    _TOTAL_CLIENTS = 0
+
     def __init__(self, config: "Config", transport_registry: TransportRegistry = None):
+        self._setup_bus_client_thread()
+        self._setup_bus_client(config=config, transport_registry=transport_registry)
+
+    def _setup_bus_client_thread(self):
+        BusClient._TOTAL_CLIENTS += 1
+        self.client_thread = Thread(
+            name=f"BusClientThread{BusClient._TOTAL_CLIENTS}", target=self._run_perform_calls_worker
+        )
+        self.client_thread.start()
+        time.sleep(0.1)
+
+    @run_in_bus_thread()
+    def _setup_bus_client(self, config: "Config", transport_registry: TransportRegistry = None):
         self.config = config
         self.api_registry = Registry()
         self.plugin_registry = PluginRegistry()
@@ -88,10 +103,8 @@ class BusClient(object):
         self._background_tasks = []
         self._hook_callbacks = defaultdict(list)
         self._exit_code = 0
-        self._call_queue = janus.Queue()
-        self._is_worker = False
 
-    @assert_in_main_thread()
+    @run_in_bus_thread()
     async def setup_async(self, plugins: dict = None):
         """Setup lightbus and get it ready to consume events and/or RPCs
 
@@ -159,7 +172,7 @@ class BusClient(object):
     def close(self):
         block(self.close_async(), timeout=5)
 
-    @assert_in_main_thread()
+    @run_in_bus_thread()
     async def close_async(self):
         listener_tasks = [task for task in all_tasks() if getattr(task, "is_listener", False)]
 
@@ -174,20 +187,13 @@ class BusClient(object):
 
         await self.schema.schema_transport.close()
 
+        self.client_thread.stop()
+
     @property
     def loop(self):
         return get_event_loop()
 
-    @property
-    def is_worker(self):
-        """Is this client running within a lightbus worker?
-
-         This will be the case within a 'lightbus run' command, but not
-         when the client is being used as a simple client.
-         """
-        return self._is_worker
-
-    @assert_in_main_thread()
+    @run_in_bus_thread()
     def run_forever(self, *, consume_rpcs=True):
         self.api_registry.add(LightbusStateApi())
         self.api_registry.add(LightbusMetricsApi())
@@ -241,15 +247,11 @@ class BusClient(object):
         monitor_task = asyncio.ensure_future(self.schema.monitor())
         monitor_task.add_done_callback(make_exception_checker(die=True))
 
-        # Setup consumption of perform_calls
-        perform_calls_task = asyncio.ensure_future(self._perform_calls())
-        perform_calls_task.add_done_callback(make_exception_checker(die=True))
-
         logger.info("Executing before_server_start & on_start hooks...")
         await self._execute_hook("before_server_start")
         logger.info("Execution of before_server_start & on_start hooks was successful")
 
-        return consume_rpc_task, monitor_task, perform_calls_task
+        return consume_rpc_task, monitor_task
 
     def _actually_run_forever(self):  # pragma: no cover
         """Simply start the loop running forever
@@ -264,9 +266,14 @@ class BusClient(object):
         self.loop.stop()
         logger.info("Shutdown complete")
 
+    def _run_perform_calls_worker(self):
+        loop = get_event_loop()
+        self._call_queue = janus.Queue()
+        loop.run_until_complete(self._perform_calls())
+
     # RPCs
 
-    @run_in_main_thread()
+    @run_in_bus_thread()
     async def consume_rpcs(self, apis: List[Api] = None):
         if apis is None:
             apis = self.api_registry.all()
@@ -332,7 +339,7 @@ class BusClient(object):
 
             await self.send_result(rpc_message=rpc_message, result_message=result_message)
 
-    @run_in_main_thread()
+    @run_in_bus_thread()
     async def call_rpc_remote(
         self, api_name: str, name: str, kwargs: dict = frozendict(), options: dict = frozendict()
     ):
@@ -454,7 +461,7 @@ class BusClient(object):
 
     # Events
 
-    @run_in_main_thread()
+    @run_in_bus_thread()
     async def fire_event(self, api_name, name, kwargs: dict = None, options: dict = None):
         kwargs = kwargs or {}
         try:
@@ -511,7 +518,7 @@ class BusClient(object):
             [(api_name, name)], listener, listener_name=listener_name, options=options
         )
 
-    @run_in_main_thread()
+    @run_in_bus_thread()
     async def listen_for_events(
         self, events: List[Tuple[str, str]], listener, listener_name: str, options: dict = None
     ):
@@ -607,7 +614,7 @@ class BusClient(object):
         elif isinstance(message, ResultMessage):
             self.schema.validate_response(api_name, event_or_rpc_name, message.result)
 
-    @run_in_main_thread()
+    @run_in_bus_thread()
     def add_background_task(
         self, coroutine: Union[Coroutine, asyncio.Future], cancel_on_close=True
     ) -> asyncio.Task:
@@ -808,7 +815,7 @@ class BusClient(object):
     def register_api(self, api: Api):
         block(self.register_api_async(api), timeout=5)
 
-    @run_in_main_thread()
+    @run_in_bus_thread()
     async def register_api_async(self, api: Api):
         self.api_registry.add(api)
         await self.schema.add_api(api)
@@ -820,17 +827,23 @@ class BusClient(object):
 
         Launched in Client.run_forever()
         """
-        # TODO: The name 'perform_calls' is to generic, find all uses and rename to something better
+        # TODO: The name 'perform_calls' is too generic, find all uses and rename to something better
         while True:
             # Wait for calls
             logger.debug("Awaiting calls on the call queue")
             fn, args, kwargs, result_queue = await self._call_queue.async_q.get()
 
             # Execute call
-            logger.debug("Call received, executing")
+            logger.debug(f"Call received for {fn.__name__}, executing")
             try:
-                result = await fn(*args, **kwargs)
+                result = fn(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    result = await result
             except Exception as e:
+                import ipdb
+
+                ipdb.set_trace()
+                logger.debug(f"Exception encountered for {fn.__name__}: {e}")
                 result = e
 
             # Acknowledge the completion

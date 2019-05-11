@@ -49,7 +49,6 @@ async def test_bus_fixture(bus: lightbus.path.BusPath):
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(5)
 @pytest.mark.also_run_in_child_thread
 async def test_rpc(bus: lightbus.path.BusPath, dummy_api, thread):
     """Full rpc call integration test"""

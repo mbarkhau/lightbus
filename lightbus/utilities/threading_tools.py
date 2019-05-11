@@ -9,44 +9,32 @@ from lightbus.exceptions import CannotRunInChildThread
 logger = logging.getLogger(__name__)
 
 
-def run_in_main_thread():
+def run_in_bus_thread():
     """Decorator to ensure any method invocations are passed to the main thread"""
-    destination_thread = threading.current_thread()
 
     def decorator(fn):
         return_awaitable = asyncio.iscoroutinefunction(fn)
 
         def wrapper(*args, **kwargs):
-            if destination_thread == threading.current_thread():
-                return fn(*args, **kwargs)
-
             # Assume the first arg is the 'self', i.e. the bus client
-            bus = args[0]
+            bus_client = args[0]
 
-            if not bus.is_worker:
-                # Calls will only be picked up by the destination thread if we are
-                # running within a worker, as we rely on the BusClient._perform_calls()
-                # coroutine running in the background
-                raise CannotRunInChildThread(
-                    f"This functionality cannot be called from within child thread "
-                    f"{threading.current_thread().name}. "
-                    f"Call this functionality from within {destination_thread.name}. "
-                    f"This limitation does not apply for code run within a worker (i.e. 'lightbus run')."
-                )
+            if threading.current_thread() == bus_client.client_thread:
+                return fn(*args, **kwargs)
 
             # We'll provide a queue as the return path for results
             result_queue = janus.Queue()
 
             # Enqueue the function, it's arguments, and our return path queue
-            logger.debug("Adding callable to queue")
-            bus._call_queue.sync_q.put((fn, args, kwargs, result_queue))
+            logger.debug(f"Adding callable {fn.__name__} to queue")
+            bus_client._call_queue.sync_q.put((fn, args, kwargs, result_queue))
 
             # Wait for a return value on the result queue
             logger.debug("Awaiting execution completion")
             result = result_queue.sync_q.get()
 
             # Cleanup
-            bus._call_queue.sync_q.join()  # Needed?
+            bus_client._call_queue.sync_q.join()  # Needed?
             result_queue.close()
 
             if isinstance(result, asyncio.Future):
@@ -56,8 +44,8 @@ def run_in_main_thread():
                     message=(
                         f"You are trying to access a Future (or Task) which cannot be safely used in this thread.\n\n"
                         f"This Future was returned by {fn.__module__}.{fn.__name__}() and was created within "
-                        f"thead {destination_thread} and returned back to thread {threading.current_thread()}.\n\n"
-                        f"This functionality was provided by the @run_in_main_thread decorator, which is also the "
+                        f"thead {bus_client.thread.name} and returned back to thread {threading.current_thread()}.\n\n"
+                        f"This functionality was provided by the @run_in_bus_thread decorator, which is also the "
                         f"source of this message.\n\n"
                         f"Reason: Futures are tied to a specific event loop, and event loops are thread-specific. "
                         f"Passing futures between threads is therefore a really bad idea, as the future will be "
@@ -79,14 +67,18 @@ def run_in_main_thread():
     return decorator
 
 
-def assert_in_main_thread():
+def assert_in_client_thread():
     def decorator(fn):
         def wrapper(*args, **kwargs):
+            # Assume the first arg is the 'self', i.e. the bus client
+            bus_client = args[0]
+
             # TODO: Improved error message, include function name
-            if threading.main_thread() != threading.current_thread():
+            if threading.current_thread() != bus_client.client_thread:
                 raise CannotRunInChildThread(
-                    "This functionality cannot be used from within a child thread. "
-                    "This functionality must be called within the main thread."
+                    f"The function {fn.__module__}.{fn.__name__} must be used from within the thread which "
+                    f"initialised the bus client ({bus_client.client_thread.name}). The current thread "
+                    f"is {threading.current_thread().name}."
                 )
             return fn(*args, **kwargs)
 
